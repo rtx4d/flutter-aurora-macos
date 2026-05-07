@@ -1,0 +1,11 @@
+# Docker build context for the Aurora image
+
+**
+
+!Dockerfile
+!entrypoint.sh
+!install-cross-targets.sh
+!.dockerignore
+
+!cache/
+!cache/**

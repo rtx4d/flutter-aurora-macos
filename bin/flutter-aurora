@@ -1,0 +1,693 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+resolve_self() {
+    local source="${BASH_SOURCE[0]}"
+    local dir
+    while [ -L "${source}" ]; do
+        dir="$(cd -P "$(dirname "${source}")" && pwd)"
+        source="$(readlink "${source}")"
+        case "${source}" in
+            /*) ;;
+            *) source="${dir}/${source}" ;;
+        esac
+    done
+    dir="$(cd -P "$(dirname "${source}")" && pwd)"
+    printf '%s/%s\n' "${dir}" "$(basename "${source}")"
+}
+
+SCRIPT_PATH="$(resolve_self)"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+TOOL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+IMAGE="${AURORA_IMAGE:-auroraos-flutter:3.35.7}"
+PSDK_VERSION="${AURORA_PSDK_VERSION:-5.2.1.70}"
+KEY_DIR="${AURORA_KEYS_DIR:-${TOOL_DIR}/.auroraos-regular-keys}"
+KEY_FILE="${AURORA_KEY_FILE:-regular_key.pem}"
+CERT_FILE="${AURORA_CERT_FILE:-regular_cert.pem}"
+DEFAULT_PROJECT_DIR="${AURORA_PROJECT_DIR:-${PWD}}"
+
+ARCH="${ARCH:-arm}"
+SIGN=1
+INIT_AURORA=0
+CLEAN=0
+PROJECT_DIR=""
+
+usage() {
+    cat <<EOF
+Usage:
+  $(basename "$0") build [options] [project-dir]
+  $(basename "$0") sign [options] <rpm-or-dir>...
+  $(basename "$0") verify <rpm-or-dir>...
+  $(basename "$0") init [project-dir]
+  $(basename "$0") doctor [project-dir]
+  $(basename "$0") image [--builder NAME] [--image IMAGE]
+
+Build options:
+  --arch arm|arm64       Target architecture. Default: arm
+  --no-sign              Build RPM without Aurora external signature
+  --sign                 Sign RPM after build. Default
+  --init-aurora          Run flutter create --platforms=aurora --no-pub if aurora/ is missing
+  --clean                Remove only Aurora build output for selected arch before build
+  --image IMAGE          Docker image. Default: ${IMAGE}
+  --keys DIR             Directory with ${KEY_FILE} and ${CERT_FILE}
+
+Environment:
+  ARCH=arm|arm64
+  AURORA_IMAGE=${IMAGE}
+  AURORA_KEYS_DIR=${KEY_DIR}
+  AURORA_PROJECT_DIR=${DEFAULT_PROJECT_DIR}
+  KEY_PASSPHRASE=...     Optional passphrase for encrypted signing key
+
+Examples:
+  flutter-aurora image
+  cd ../testing && flutter-aurora build --arch arm
+  flutter-aurora build --arch arm64 --no-sign ~/projects/my_flutter_app
+  flutter-aurora sign build/aurora/psdk_${PSDK_VERSION}/aurora-arm/release/RPMS
+EOF
+}
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+abs_path() {
+    local path="$1"
+    if [[ -d "$path" ]]; then
+        (cd "$path" && pwd)
+    else
+        local dir base
+        dir="$(dirname "$path")"
+        base="$(basename "$path")"
+        (cd "$dir" && printf '%s/%s\n' "$(pwd)" "$base")
+    fi
+}
+
+docker_run() {
+    local args=(
+        run --rm
+        --platform=linux/amd64
+        --privileged
+        --security-opt seccomp=unconfined
+        --security-opt apparmor=unconfined
+    )
+
+    if [[ -n "${PROJECT_DIR}" ]]; then
+        args+=(-v "${PROJECT_DIR}:/workspace" -w /workspace)
+    fi
+
+    if [[ -d "${KEY_DIR}" ]]; then
+        args+=(-v "${KEY_DIR}:/aurora-keys:ro")
+    fi
+
+    if [[ -n "${KEY_PASSPHRASE:-}" ]]; then
+        args+=(-e KEY_PASSPHRASE)
+    fi
+
+    docker "${args[@]}" "${IMAGE}" "$@"
+}
+
+run_in_chroot() {
+    local cmd="$1"
+    local cmd_q
+    printf -v cmd_q '%q' "${cmd}"
+    docker_run bash -lc "sudo \"\$PSDK_DIR/sdk-chroot\" bash -lc ${cmd_q}"
+}
+
+configure_arch() {
+    case "${ARCH}" in
+        arm|armv7hl)
+            ARCH="arm"
+            FLUTTER_TARGET="aurora-arm"
+            BUILD_REL="build/aurora/psdk_${PSDK_VERSION}/aurora-arm/release"
+            RPM_TARGET="AuroraOS-${PSDK_VERSION}-base-armv7hl"
+            RPM_CPU="armv7hl"
+            ;;
+        arm64|aarch64)
+            ARCH="arm64"
+            FLUTTER_TARGET="aurora-arm64"
+            BUILD_REL="build/aurora/psdk_${PSDK_VERSION}/aurora-arm64/release"
+            RPM_TARGET="AuroraOS-${PSDK_VERSION}-base-aarch64"
+            RPM_CPU="aarch64"
+            ;;
+        *)
+            die "unsupported --arch '${ARCH}', use arm or arm64"
+            ;;
+    esac
+}
+
+require_project() {
+    PROJECT_DIR="$(abs_path "${1:-${DEFAULT_PROJECT_DIR}}")"
+    [[ -f "${PROJECT_DIR}/pubspec.yaml" ]] || die "pubspec.yaml not found in ${PROJECT_DIR}"
+}
+
+require_keys() {
+    [[ -d "${KEY_DIR}" ]] || die "keys directory not found: ${KEY_DIR}"
+    [[ -f "${KEY_DIR}/${KEY_FILE}" ]] || die "signing key not found: ${KEY_DIR}/${KEY_FILE}"
+    [[ -f "${KEY_DIR}/${CERT_FILE}" ]] || die "signing cert not found: ${KEY_DIR}/${CERT_FILE}"
+}
+
+copy_path_if_exists() {
+    local src="$1"
+    local dst="$2"
+    if [[ -e "${src}" ]]; then
+        cp -R "${src}" "${dst}"
+    fi
+}
+
+write_build_helpers() {
+    local build_dir="$1"
+
+    mkdir -p "${build_dir}/cmake" "${build_dir}/tools"
+
+    cat > "${build_dir}/cmake/FindPkgConfig.cmake" <<'EOF'
+set(PkgConfig_FOUND TRUE)
+
+function(pkg_check_modules prefix)
+    if("${prefix}" STREQUAL "GLIB2" AND NOT TARGET PkgConfig::GLIB2)
+        set(_glib_lib_include "/usr/lib64/glib-2.0/include")
+        if(NOT EXISTS "${_glib_lib_include}")
+            set(_glib_lib_include "/usr/lib/glib-2.0/include")
+        endif()
+        add_library(PkgConfig::GLIB2 INTERFACE IMPORTED)
+        set_target_properties(PkgConfig::GLIB2 PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "/usr/include/glib-2.0;${_glib_lib_include}"
+            INTERFACE_LINK_LIBRARIES "glib-2.0"
+        )
+    endif()
+    set(${prefix}_FOUND TRUE PARENT_SCOPE)
+endfunction()
+EOF
+
+    cat > "${build_dir}/tools/flock" <<'EOF'
+#!/bin/sh
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -c|--command)
+            shift
+            exec sh -c "$1"
+            ;;
+        -w|--wait|-E|--conflict-exit-code)
+            shift 2
+            ;;
+        -*)
+            shift
+            ;;
+        *)
+            shift
+            break
+            ;;
+    esac
+done
+
+if [ "$#" -eq 0 ]; then
+    exit 0
+fi
+
+if [ "${1:-}" = "-c" ]; then
+    shift
+    exec sh -c "$1"
+fi
+
+exec "$@"
+EOF
+    chmod +x "${build_dir}/tools/flock"
+}
+
+patch_cmake_lists() {
+    local cmake_file="$1"
+    local tmp
+
+    [[ -f "${cmake_file}" ]] || die "CMakeLists.txt not found in build tree"
+
+    if ! grep -q 'AURORA_TARGET_CPU_NAME' "${cmake_file}"; then
+        tmp="$(mktemp)"
+        awk '
+            { print }
+            /^include\(GNUInstallDirs\)/ {
+                print ""
+                print "if(DEFINED AURORA_TARGET_CPU_NAME)"
+                print "    set(CMAKE_SYSTEM_PROCESSOR ${AURORA_TARGET_CPU_NAME})"
+                print "elseif(NOT CMAKE_SYSTEM_PROCESSOR MATCHES \"^(x64|x86_64|ARM64|aarch64|ARM|armv7hl|armv7l|armv7)\")"
+                print "    set(CMAKE_SYSTEM_PROCESSOR aarch64)"
+                print "endif()"
+                print "list(PREPEND CMAKE_MODULE_PATH \"${CMAKE_CURRENT_SOURCE_DIR}/cmake\")"
+            }
+        ' "${cmake_file}" > "${tmp}"
+        mv "${tmp}" "${cmake_file}"
+    fi
+}
+
+patch_generated_plugins() {
+    local plugins_file="$1"
+    local tmp
+
+    [[ -f "${plugins_file}" ]] || return 0
+
+    tmp="$(mktemp)"
+    sed 's|"/workspace/|"/parentroot/workspace/|g' "${plugins_file}" > "${tmp}"
+    mv "${tmp}" "${plugins_file}"
+
+    if ! grep -q '/home/mer/.local/opt/flutter_aurora/bin/cache/artifacts/aurora_embedder/aurora' "${plugins_file}"; then
+        cat >> "${plugins_file}" <<'EOF'
+
+list(APPEND CMAKE_MODULE_PATH "/home/mer/.local/opt/flutter_aurora/bin/cache/artifacts/aurora_embedder/aurora")
+EOF
+    fi
+}
+
+patch_spec() {
+    local spec_file="$1"
+    local tmp
+
+    [[ -f "${spec_file}" ]] || die "spec file not found in build tree"
+
+    tmp="$(mktemp)"
+    awk -v psdk_version="${PSDK_VERSION}" '
+        function print_build() {
+            print "%build"
+            print "/parentroot/home/mer/AuroraPlatformSDK/targets/AuroraOS-" psdk_version "-base-x86_64.default/usr/bin/cmake \\"
+            print "    -DCMAKE_VERBOSE_MAKEFILE=ON \\"
+            print "    -DCMAKE_INSTALL_PREFIX:PATH=/usr \\"
+            print "    -DINCLUDE_INSTALL_DIR:PATH=/usr/include \\"
+            print "    -DLIB_INSTALL_DIR:PATH=lib \\"
+            print "    -DCMAKE_INSTALL_LIBDIR:PATH=lib \\"
+            print "    -DSYSCONF_INSTALL_DIR:PATH=/etc \\"
+            print "    -DSHARE_INSTALL_PREFIX:PATH=/usr/share \\"
+            print "    -DCMAKE_SKIP_RPATH:BOOL=ON \\"
+            print "    -DBUILD_SHARED_LIBS:BOOL=ON \\"
+            print "    -DCMAKE_SYSTEM_PROCESSOR=%{_flutter_target_cpu} \\"
+            print "    -DAURORA_TARGET_CPU_NAME=%{_flutter_target_cpu} \\"
+            print "    -DCMAKE_CXX_COMPILER_WORKS=1 \\"
+            print "    -DCMAKE_CXX_COMPILER_FORCED=1 \\"
+            print "    -DCMAKE_RULE_MESSAGES=OFF \\"
+            print "    -DCMAKE_COLOR_MAKEFILE=OFF \\"
+            print "    -DCMAKE_BUILD_TYPE=%{_flutter_build_type} \\"
+            print "    -DPSDK_VERSION=%{_flutter_psdk_version} \\"
+            print "    -DPSDK_MAJOR=%{_flutter_psdk_major} \\"
+            print "    -DFLUTTER_PROJECT_NAME=%{name}"
+            print "%make_build"
+        }
+        function print_install() {
+            print "%install"
+            print "/usr/bin/make install DESTDIR=%{buildroot} INSTALL=\"/usr/bin/install -p\""
+        }
+        $0 == "%build" {
+            print_build()
+            in_build = 1
+            next
+        }
+        in_build && $0 == "%install" {
+            print_install()
+            in_build = 0
+            in_install = 1
+            next
+        }
+        in_build {
+            next
+        }
+        in_install && $0 ~ /^%(files|check|pre|post|preun|postun|posttrans|changelog|package|description)([[:space:]]|$)/ {
+            in_install = 0
+            print
+            next
+        }
+        in_install {
+            next
+        }
+        { print }
+    ' "${spec_file}" > "${tmp}"
+    mv "${tmp}" "${spec_file}"
+}
+
+prepare_build_tree() {
+    local build_dir="${PROJECT_DIR}/${BUILD_REL}"
+    local spec_file
+
+    [[ -d "${build_dir}/bundle" ]] || die "bundle directory not found: ${build_dir}/bundle"
+
+    rm -rf \
+        "${build_dir}/CMakeLists.txt" \
+        "${build_dir}/main.cpp" \
+        "${build_dir}/desktop" \
+        "${build_dir}/flutter" \
+        "${build_dir}/icons" \
+        "${build_dir}/rpm" \
+        "${build_dir}/cmake" \
+        "${build_dir}/tools" \
+        "${build_dir}/CMakeFiles" \
+        "${build_dir}/CMakeCache.txt" \
+        "${build_dir}/Makefile" \
+        "${build_dir}/cmake_install.cmake"
+
+    copy_path_if_exists "${PROJECT_DIR}/aurora/CMakeLists.txt" "${build_dir}/"
+    copy_path_if_exists "${PROJECT_DIR}/aurora/main.cpp" "${build_dir}/"
+    copy_path_if_exists "${PROJECT_DIR}/aurora/desktop" "${build_dir}/"
+    copy_path_if_exists "${PROJECT_DIR}/aurora/flutter" "${build_dir}/"
+    copy_path_if_exists "${PROJECT_DIR}/aurora/icons" "${build_dir}/"
+    copy_path_if_exists "${PROJECT_DIR}/aurora/rpm" "${build_dir}/"
+    copy_path_if_exists "${PROJECT_DIR}/aurora/cmake" "${build_dir}/"
+    copy_path_if_exists "${PROJECT_DIR}/aurora/tools" "${build_dir}/"
+
+    write_build_helpers "${build_dir}"
+    patch_cmake_lists "${build_dir}/CMakeLists.txt"
+    patch_generated_plugins "${build_dir}/flutter/generated_plugins.cmake"
+
+    spec_file="$(find "${build_dir}/rpm" -maxdepth 1 -type f -name '*.spec' | head -1)"
+    [[ -n "${spec_file}" ]] || die "no .spec file found in ${build_dir}/rpm"
+    patch_spec "${spec_file}"
+}
+
+init_aurora() {
+    require_project "${1:-${DEFAULT_PROJECT_DIR}}"
+    if [[ -f "${PROJECT_DIR}/aurora/CMakeLists.txt" ]]; then
+        echo "Aurora platform already exists: ${PROJECT_DIR}/aurora"
+        return
+    fi
+
+    echo "Initializing Aurora platform in ${PROJECT_DIR}"
+    docker_run bash -lc 'flutter create --platforms=aurora --no-pub .'
+}
+
+build_project() {
+    local flutter_status
+    local build_dir
+    local remote_cmd
+    local rpm_dir
+
+    configure_arch
+    require_project "${PROJECT_DIR:-${DEFAULT_PROJECT_DIR}}"
+
+    if [[ ! -f "${PROJECT_DIR}/aurora/CMakeLists.txt" ]]; then
+        if [[ "${INIT_AURORA}" -eq 1 ]]; then
+            init_aurora "${PROJECT_DIR}"
+        else
+            die "Aurora platform is missing. Run 'flutter-aurora init ${PROJECT_DIR}' or pass --init-aurora."
+        fi
+    fi
+
+    if [[ "${SIGN}" -eq 1 ]]; then
+        require_keys
+    fi
+
+    build_dir="${PROJECT_DIR}/${BUILD_REL}"
+
+    if [[ "${CLEAN}" -eq 1 ]]; then
+        rm -rf "${build_dir}"
+    fi
+
+    set +e
+    docker_run bash -lc "flutter pub get && flutter build aurora --release --target-platform=${FLUTTER_TARGET}"
+    flutter_status=$?
+    set -e
+
+    if [[ ! -f "${build_dir}/bundle/lib/libapp.so" || ! -f "${build_dir}/bundle/lib/libflutter_engine.so" ]]; then
+        die "Flutter bundle was not produced; flutter build exit code: ${flutter_status}"
+    fi
+
+    prepare_build_tree
+
+    remote_cmd="cd /parentroot/workspace/${BUILD_REL} && PATH=/parentroot/workspace/${BUILD_REL}/tools:\$PATH mb2 --target ${RPM_TARGET} --no-fix-version build . -- --define '_flutter_target_cpu ${RPM_CPU}'"
+    run_in_chroot "${remote_cmd}"
+
+    rpm_dir="${build_dir}/RPMS"
+    [[ -d "${rpm_dir}" ]] || die "RPM output directory not found: ${rpm_dir}"
+
+    if [[ "${SIGN}" -eq 1 ]]; then
+        sign_paths "${rpm_dir}"
+        verify_paths "${rpm_dir}"
+    fi
+
+    find "${rpm_dir}" -maxdepth 1 -type f -name '*.rpm' -print
+}
+
+rpm_paths_for() {
+    local path
+    for path in "$@"; do
+        path="$(abs_path "${path}")"
+        if [[ -d "${path}" ]]; then
+            find "${path}" -maxdepth 1 -type f -name '*.rpm' -print
+        elif [[ -f "${path}" && "${path}" == *.rpm ]]; then
+            printf '%s\n' "${path}"
+        else
+            die "not an RPM file or directory: ${path}"
+        fi
+    done
+}
+
+sign_paths() {
+    require_keys
+    local rpms=()
+    local rpm
+    while IFS= read -r rpm; do
+        rpms+=("${rpm}")
+    done < <(rpm_paths_for "$@")
+
+    [[ "${#rpms[@]}" -gt 0 ]] || die "no RPM files found"
+
+    for rpm in "${rpms[@]}"; do
+        local container_rpm="/parentroot/workspace/${rpm#${PROJECT_DIR}/}"
+        if [[ -z "${PROJECT_DIR}" || "${rpm}" != "${PROJECT_DIR}/"* ]]; then
+            PROJECT_DIR="$(dirname "${rpm}")"
+            container_rpm="/parentroot/workspace/$(basename "${rpm}")"
+        fi
+        run_in_chroot "rpmsign-external sign -f -k /parentroot/aurora-keys/${KEY_FILE} -c /parentroot/aurora-keys/${CERT_FILE} ${container_rpm}"
+    done
+}
+
+verify_paths() {
+    local rpms=()
+    local rpm
+    while IFS= read -r rpm; do
+        rpms+=("${rpm}")
+    done < <(rpm_paths_for "$@")
+
+    [[ "${#rpms[@]}" -gt 0 ]] || die "no RPM files found"
+
+    for rpm in "${rpms[@]}"; do
+        local container_rpm="/parentroot/workspace/${rpm#${PROJECT_DIR}/}"
+        if [[ -z "${PROJECT_DIR}" || "${rpm}" != "${PROJECT_DIR}/"* ]]; then
+            PROJECT_DIR="$(dirname "${rpm}")"
+            container_rpm="/parentroot/workspace/$(basename "${rpm}")"
+        fi
+        run_in_chroot "rpmsign-external verify ${container_rpm} && rpmsign-external dump ${container_rpm}"
+    done
+}
+
+doctor() {
+    require_project "${1:-${DEFAULT_PROJECT_DIR}}"
+    configure_arch
+    echo "Project: ${PROJECT_DIR}"
+    echo "Image: ${IMAGE}"
+    echo "Arch: ${ARCH} (${FLUTTER_TARGET}, ${RPM_TARGET})"
+    if [[ -d "${KEY_DIR}" ]]; then
+        echo "Keys: ${KEY_DIR}"
+    else
+        echo "Keys: missing (${KEY_DIR})"
+    fi
+    docker image inspect "${IMAGE}" >/dev/null
+    docker_run bash -lc 'flutter doctor -v | sed -n "1,40p"; echo "--- targets ---"; sudo "$PSDK_DIR/sdk-chroot" sb2-config -l | tail -20'
+}
+
+build_image() {
+    local builder="aurora-builder"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --builder)
+                [[ $# -ge 2 ]] || die "--builder requires a value"
+                builder="$2"
+                shift 2
+                ;;
+            --builder=*)
+                builder="${1#*=}"
+                shift
+                ;;
+            --image)
+                [[ $# -ge 2 ]] || die "--image requires a value"
+                IMAGE="$2"
+                shift 2
+                ;;
+            --image=*)
+                IMAGE="${1#*=}"
+                shift
+                ;;
+            -*)
+                die "unknown image option: $1"
+                ;;
+            *)
+                die "unexpected image argument: $1"
+                ;;
+        esac
+    done
+
+    if ! docker buildx inspect "${builder}" >/dev/null 2>&1; then
+        docker buildx create --name "${builder}" --driver docker-container --use >/dev/null
+    fi
+
+    docker buildx build \
+        --builder "${builder}" \
+        --allow security.insecure \
+        --platform=linux/amd64 \
+        -t "${IMAGE}" \
+        --load \
+        "${TOOL_DIR}"
+}
+
+parse_common_option() {
+    case "$1" in
+        --arch)
+            [[ $# -ge 2 ]] || die "--arch requires a value"
+            ARCH="$2"
+            return 2
+            ;;
+        --arch=*)
+            ARCH="${1#*=}"
+            return 1
+            ;;
+        --image)
+            [[ $# -ge 2 ]] || die "--image requires a value"
+            IMAGE="$2"
+            return 2
+            ;;
+        --image=*)
+            IMAGE="${1#*=}"
+            return 1
+            ;;
+        --keys)
+            [[ $# -ge 2 ]] || die "--keys requires a value"
+            KEY_DIR="$(abs_path "$2")"
+            return 2
+            ;;
+        --keys=*)
+            KEY_DIR="$(abs_path "${1#*=}")"
+            return 1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+cmd="${1:-build}"
+case "${cmd}" in
+    build|sign|verify|init|doctor|image)
+        shift || true
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        cmd="build"
+        ;;
+esac
+
+case "${cmd}" in
+    build)
+        args=()
+        while [[ $# -gt 0 ]]; do
+            consumed=0
+            parse_common_option "$@" || consumed=$?
+            if [[ "${consumed}" -gt 0 ]]; then
+                shift "${consumed}"
+                continue
+            fi
+            case "$1" in
+                --no-sign)
+                    SIGN=0
+                    shift
+                    ;;
+                --sign)
+                    SIGN=1
+                    shift
+                    ;;
+                --init-aurora)
+                    INIT_AURORA=1
+                    shift
+                    ;;
+                --clean)
+                    CLEAN=1
+                    shift
+                    ;;
+                -*)
+                    die "unknown build option: $1"
+                    ;;
+                *)
+                    args+=("$1")
+                    shift
+                    ;;
+            esac
+        done
+        [[ "${#args[@]}" -le 1 ]] || die "build accepts at most one project directory"
+        PROJECT_DIR="$(abs_path "${args[0]:-${DEFAULT_PROJECT_DIR}}")"
+        build_project
+        ;;
+    sign)
+        while [[ $# -gt 0 ]]; do
+            consumed=0
+            parse_common_option "$@" || consumed=$?
+            if [[ "${consumed}" -gt 0 ]]; then
+                shift "${consumed}"
+                continue
+            fi
+            break
+        done
+        [[ $# -gt 0 ]] || die "sign requires at least one RPM file or directory"
+        first="$(abs_path "$1")"
+        if [[ -d "${first}" ]]; then
+            PROJECT_DIR="${first}"
+        else
+            PROJECT_DIR="$(dirname "${first}")"
+        fi
+        sign_paths "$@"
+        verify_paths "$@"
+        ;;
+    verify)
+        [[ $# -gt 0 ]] || die "verify requires at least one RPM file or directory"
+        first="$(abs_path "$1")"
+        if [[ -d "${first}" ]]; then
+            PROJECT_DIR="${first}"
+        else
+            PROJECT_DIR="$(dirname "${first}")"
+        fi
+        verify_paths "$@"
+        ;;
+    init)
+        args=()
+        while [[ $# -gt 0 ]]; do
+            consumed=0
+            parse_common_option "$@" || consumed=$?
+            if [[ "${consumed}" -gt 0 ]]; then
+                shift "${consumed}"
+                continue
+            fi
+            args+=("$1")
+            shift
+        done
+        [[ "${#args[@]}" -le 1 ]] || die "init accepts at most one project directory"
+        init_aurora "${args[0]:-${DEFAULT_PROJECT_DIR}}"
+        ;;
+    doctor)
+        args=()
+        while [[ $# -gt 0 ]]; do
+            consumed=0
+            parse_common_option "$@" || consumed=$?
+            if [[ "${consumed}" -gt 0 ]]; then
+                shift "${consumed}"
+                continue
+            fi
+            args+=("$1")
+            shift
+        done
+        [[ "${#args[@]}" -le 1 ]] || die "doctor accepts at most one project directory"
+        doctor "${args[0]:-${DEFAULT_PROJECT_DIR}}"
+        ;;
+    image)
+        build_image "$@"
+        ;;
+esac

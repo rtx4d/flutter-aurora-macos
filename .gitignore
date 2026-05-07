@@ -1,0 +1,16 @@
+# Local archives used by Dockerfile RUN --mount=type=bind.
+# Keep them on disk, do not commit them.
+/cache/
+
+# Local signing material.
+/.auroraos-regular-keys/
+
+# Local output / diagnostics
+*.log
+.DS_Store
+/build/
+/tmp/
+
+# Optional local env files
+.env
+.env.*
